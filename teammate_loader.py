@@ -181,6 +181,36 @@ def _normalize_next_link(next_link: str, base_url: str) -> str:
     return urljoin(base_url.rstrip("/") + "/", next_link.lstrip("/"))
 
 
+def _next_url(
+        payload: Dict[str, Any],
+        page_rows: List[Any],
+        base_url: str,
+        entity_set: str,
+        page_size: int,
+        skip: int,
+) -> tuple[Optional[str], int]:
+    """Resolve the URL for the next page using a hybrid strategy.
+
+    Priority:
+      1. @odata.nextLink / odata.nextLink — server-driven, preferred.
+      2. $skip/$top fallback — for APIs like TeamMate that return full pages but
+         never send a nextLink. A full page (len == page_size) means there may be
+         more; a partial page means we are at the end.
+
+    Returns (next_url, updated_skip). skip is only advanced in the fallback branch
+    so server-driven nextLinks are followed as-is without double-advancing.
+    """
+    next_link = payload.get("@odata.nextLink") or payload.get("odata.nextLink")
+    if next_link:
+        return _normalize_next_link(next_link, base_url), skip
+
+    if len(page_rows) == page_size:
+        new_skip = skip + page_size
+        return f"{base_url}/{entity_set}?$top={page_size}&$skip={new_skip}", new_skip
+
+    return None, skip
+
+
 # ---------------------------------------------------------------------------
 # DB write helpers
 # ---------------------------------------------------------------------------
@@ -224,6 +254,7 @@ async def _run_single_txn_load(
     rows_fetched = 0
     rows_loaded = 0
     page_num = 0
+    skip = 0
     url: Optional[str] = f"{base_url}/{entity_set}?$top={page_size}"
 
     async with session_factory() as session:
@@ -240,8 +271,7 @@ async def _run_single_txn_load(
                     coerced = [_coerce_row(r, model_class) for r in page_rows]
                     rows_loaded += await _insert_rows(session, model_class, coerced)
 
-                next_link = payload.get("@odata.nextLink")
-                url = _normalize_next_link(next_link, base_url) if next_link else None
+                url, skip = _next_url(payload, page_rows, base_url, entity_set, page_size, skip)
 
                 if page_num % 10 == 0:
                     logger.info(
@@ -311,10 +341,11 @@ async def _run_staging_swap_load(
                 f"(LIKE {qlive} INCLUDING DEFAULTS)"
             ))
 
-    # 2. Stream every @odata.nextLink page into staging (short transactions).
+    # 2. Stream every page into staging (short transactions, hybrid pagination).
     rows_fetched = 0
     rows_loaded = 0
     page_num = 0
+    skip = 0
     url: Optional[str] = f"{base_url}/{entity_set}?$top={page_size}"
 
     while url:
@@ -330,8 +361,7 @@ async def _run_staging_swap_load(
                     await session.execute(insert(staging_table), coerced)
             rows_loaded += len(coerced)
 
-        next_link = payload.get("@odata.nextLink")
-        url = _normalize_next_link(next_link, base_url) if next_link else None
+        url, skip = _next_url(payload, page_rows, base_url, entity_set, page_size, skip)
 
         if page_num % 10 == 0:
             logger.info(
